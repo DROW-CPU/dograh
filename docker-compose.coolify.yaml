@@ -1,0 +1,228 @@
+# Select this file with the Docker Compose build strategy in Coolify.
+# Attach https://voice.bluskyvas.com:8080 to the gateway service only.
+# Coolify generates the five SERVICE_PASSWORD_64_* variables below.
+# The API Dockerfile needs the pipecat Git submodule: enable Git submodules.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_64_POSTGRES:?Generate the PostgreSQL secret in Coolify}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${SERVICE_PASSWORD_64_REDIS:?Generate the Redis secret in Coolify}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+  minio:
+    image: ${REGISTRY:-dograhai}/minio:2026.09.22
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: dograh
+      MINIO_ROOT_PASSWORD: ${SERVICE_PASSWORD_64_MINIO:?Generate the MinIO secret in Coolify}
+      MINIO_API_CORS_ALLOW_ORIGIN: ${PUBLIC_BASE_URL:-https://voice.bluskyvas.com}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+  # Use the API's existing MinIO SDK to create a private bucket. This does not
+  # call Dograh's MinioFileSystem, which applies an anonymous bucket policy.
+  storage-init:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: dograh
+      MINIO_ROOT_PASSWORD: ${SERVICE_PASSWORD_64_MINIO:?Generate the MinIO secret in Coolify}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        import os
+        from minio import Minio
+        client = Minio(
+            "minio:9000",
+            access_key=os.environ["MINIO_ROOT_USER"],
+            secret_key=os.environ["MINIO_ROOT_PASSWORD"],
+            secure=False,
+        )
+        bucket = "voice-audio"
+        if not client.bucket_exists(bucket):
+            client.make_bucket(bucket)
+        client.delete_bucket_policy(bucket)
+        print("Private voice-audio bucket is ready.", flush=True)
+    logging: *logging
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+    environment:
+      ENVIRONMENT: production
+      DEPLOYMENT_MODE: oss
+      AUTH_PROVIDER: local
+      LOG_LEVEL: INFO
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-true}
+      PUBLIC_HOST: ${PUBLIC_HOST:-voice.bluskyvas.com}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://voice.bluskyvas.com}
+      BACKEND_API_ENDPOINT: ${PUBLIC_BASE_URL:-https://voice.bluskyvas.com}
+      UI_APP_URL: ${PUBLIC_BASE_URL:-https://voice.bluskyvas.com}
+      SERVER_IP: ${SERVER_IP:-89.116.24.99}
+      DATABASE_URL: postgresql+asyncpg://postgres:${SERVICE_PASSWORD_64_POSTGRES:?Generate the PostgreSQL secret in Coolify}@postgres:5432/postgres
+      REDIS_URL: redis://:${SERVICE_PASSWORD_64_REDIS:?Generate the Redis secret in Coolify}@redis:6379
+      OSS_JWT_SECRET: ${SERVICE_PASSWORD_64_JWT:?Generate the JWT secret in Coolify}
+      # S3-compatible mode uses bundled MinIO; an AWS account is not required.
+      # The public endpoint is also used by backend uploads, so this domain
+      # must resolve and be reachable over HTTPS from the VPS itself.
+      ENABLE_AWS_S3: "true"
+      AWS_ACCESS_KEY_ID: dograh
+      AWS_SECRET_ACCESS_KEY: ${SERVICE_PASSWORD_64_MINIO:?Generate the MinIO secret in Coolify}
+      AWS_DEFAULT_REGION: us-east-1
+      S3_BUCKET: voice-audio
+      S3_REGION: us-east-1
+      S3_ENDPOINT_URL: ${PUBLIC_BASE_URL:-https://voice.bluskyvas.com}
+      S3_SIGNATURE_VERSION: s3v4
+      S3_ADDRESSING_STYLE: path
+      FASTAPI_WORKERS: "1"
+      ARQ_WORKERS: "1"
+      FORWARDED_ALLOW_IPS: "*"
+      ENABLE_COTURN: "true"
+      # Use the public IP for TURN; HTTP CDN proxying must not intercept it.
+      TURN_HOST: ${SERVER_IP:-89.116.24.99}
+      TURN_PORT: "3478"
+      TURN_TLS_PORT: "0"
+      TURN_SECRET: ${SERVICE_PASSWORD_64_TURN:?Generate the TURN secret in Coolify}
+      FORCE_TURN_RELAY: ${FORCE_TURN_RELAY:-false}
+      ENABLE_TELEMETRY: ${ENABLE_TELEMETRY:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    logging: *logging
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    restart: unless-stopped
+    environment:
+      HOSTNAME: 0.0.0.0
+      NODE_ENV: production
+      BACKEND_URL: http://api:8000
+      ENABLE_TELEMETRY: ${ENABLE_TELEMETRY:-false}
+      # Ensure changing signup policy also recreates the UI's cached auth config.
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-true}
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "3010"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3010 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    logging: *logging
+
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/coolify/Dockerfile.gateway
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      ui:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/healthz && wget -q --spider http://ui:3010/"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging: *logging
+
+  coturn:
+    image: coturn/coturn:4.8.0
+    restart: unless-stopped
+    environment:
+      SERVER_IP: ${SERVER_IP:-89.116.24.99}
+      TURN_SECRET: ${SERVICE_PASSWORD_64_TURN:?Generate the TURN secret in Coolify}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        exec turnserver \
+          --listening-port=3478 \
+          --min-port=49152 --max-port=49200 \
+          --external-ip="$${SERVER_IP}" \
+          --realm=dograh \
+          --use-auth-secret --static-auth-secret="$${TURN_SECRET}" \
+          --fingerprint --no-cli --no-multicast-peers \
+          --no-tls --no-dtls --pidfile=/tmp/turnserver.pid --log-file=stdout
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49152-49200:49152-49200/udp"
+    logging: *logging
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
